@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
-LINCHINE_SCRIPT_VERSION="2026.05.16-os-select-update-check"
+LINCHINE_SCRIPT_VERSION="2026.05.16-force-macos-selection"
 
 LINCHINE_USER="linchine"
 LINCHINE_HOME="/home/${LINCHINE_USER}"
@@ -1246,26 +1246,78 @@ if [ "$MACOS_PRODUCT" != "manual" ]; then
         chmod +x ./fetch-macOS-v2.py
 
         case "$MACOS_PRODUCT" in
-            1) MACOS_SHORTNAME="high-sierra" ;;
-            2) MACOS_SHORTNAME="mojave" ;;
-            3) MACOS_SHORTNAME="catalina" ;;
-            4) MACOS_SHORTNAME="big-sur" ;;
-            5) MACOS_SHORTNAME="monterey" ;;
-            6) MACOS_SHORTNAME="ventura" ;;
-            7) MACOS_SHORTNAME="sonoma" ;;
-            8) MACOS_SHORTNAME="sequoia" ;;
-            9) MACOS_SHORTNAME="tahoe" ;;
-            *) MACOS_SHORTNAME="" ;;
+            1)
+                MACOS_NAME="High Sierra"
+                MACOS_BOARD_ID="Mac-7BA5B2D9E42DDD94"
+                MACOS_MLB="00000000000J80300"
+                MACOS_OS_TYPE="default"
+                ;;
+            2)
+                MACOS_NAME="Mojave"
+                MACOS_BOARD_ID="Mac-7BA5B2DFE22DDD8C"
+                MACOS_MLB="00000000000KXPG00"
+                MACOS_OS_TYPE="default"
+                ;;
+            3)
+                MACOS_NAME="Catalina"
+                MACOS_BOARD_ID="Mac-00BE6ED71E35EB86"
+                MACOS_MLB="00000000000000000"
+                MACOS_OS_TYPE="default"
+                ;;
+            4)
+                MACOS_NAME="Big Sur"
+                MACOS_BOARD_ID="Mac-2BD1B31983FE1663"
+                MACOS_MLB="00000000000000000"
+                MACOS_OS_TYPE="default"
+                ;;
+            5)
+                MACOS_NAME="Monterey"
+                MACOS_BOARD_ID="Mac-B809C3757DA9BB8D"
+                MACOS_MLB="00000000000000000"
+                MACOS_OS_TYPE="latest"
+                ;;
+            6)
+                MACOS_NAME="Ventura"
+                MACOS_BOARD_ID="Mac-4B682C642B45593E"
+                MACOS_MLB="00000000000000000"
+                MACOS_OS_TYPE="latest"
+                ;;
+            7)
+                MACOS_NAME="Sonoma"
+                MACOS_BOARD_ID="Mac-827FAC58A8FDFA22"
+                MACOS_MLB="00000000000000000"
+                MACOS_OS_TYPE="default"
+                ;;
+            8)
+                MACOS_NAME="Sequoia"
+                MACOS_BOARD_ID="Mac-7BA5B2D9E42DDD94"
+                MACOS_MLB="00000000000000000"
+                MACOS_OS_TYPE="default"
+                ;;
+            9)
+                MACOS_NAME="Tahoe"
+                MACOS_BOARD_ID="Mac-CFF7D910A743CAAF"
+                MACOS_MLB="00000000000000000"
+                MACOS_OS_TYPE="latest"
+                ;;
+            *)
+                whiptail --title "Recovery Error" --msgbox "Unknown macOS product selection: ${MACOS_PRODUCT}" 10 70
+                cancelled
+                ;;
         esac
 
-        rm -f BaseSystem.img BaseSystem.dmg RecoveryImage.dmg InstallESD.dmg *.chunklist || true
+        rm -f BaseSystem.img BaseSystem.dmg BaseSystem.chunklist RecoveryImage.dmg InstallESD.dmg *.chunklist || true
         rm -rf com.apple.recovery.boot || true
 
-        if [ -n "$MACOS_SHORTNAME" ] && python3 ./fetch-macOS-v2.py --help 2>&1 | grep -q -- "--shortname"; then
-            python3 ./fetch-macOS-v2.py --shortname "$MACOS_SHORTNAME"
-        else
-            printf "%s\n" "$MACOS_PRODUCT" | python3 ./fetch-macOS-v2.py
-        fi
+        whiptail --title "Downloading ${MACOS_NAME}" --infobox "Downloading ${MACOS_NAME} recovery directly.\n\nBoard ID: ${MACOS_BOARD_ID}\nOS type: ${MACOS_OS_TYPE}" 10 76
+
+        python3 ./fetch-macOS-v2.py \
+            --action download \
+            --board-id "$MACOS_BOARD_ID" \
+            --mlb "$MACOS_MLB" \
+            --os-type "$MACOS_OS_TYPE" \
+            --outdir . \
+            --basename BaseSystem
 
         if [ -f "BaseSystem.dmg" ]; then
             whiptail --title "Converting Recovery" --infobox "Converting BaseSystem.dmg to BaseSystem.img..." 8 72
