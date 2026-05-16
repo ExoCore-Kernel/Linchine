@@ -11,8 +11,11 @@ LINCHINE_CONFIG="${LINCHINE_CONFIG_DIR}/linchine.conf"
 OSX_DIR="${LINCHINE_DIR}/OSX-KVM-updated"
 OSX_REPO="${OSX_REPO:-https://github.com/renatus777rr/OSX-KVM-updated.git}"
 LOG_FILE="/var/log/linchine-install.log"
+SELF_UPDATE_URL_MAIN="${LINCHINE_SELF_UPDATE_URL:-https://raw.githubusercontent.com/ExoCore-Kernel/Linchine/main/linchine.sh}"
+SELF_UPDATE_URL_MASTER="${LINCHINE_SELF_UPDATE_URL_MASTER:-https://raw.githubusercontent.com/ExoCore-Kernel/Linchine/master/linchine.sh}"
 
 log() {
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
     echo "[Linchine] $*" | tee -a "$LOG_FILE"
 }
 
@@ -46,14 +49,79 @@ check_required_admin_commands() {
     fi
 }
 
+fetch_url() {
+    local url="$1"
+    local out="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" -o "$out"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$out" "$url"
+    else
+        return 1
+    fi
+}
+
+run_self_update() {
+    # Best-effort self update. It never blocks install if the network/repo is unavailable.
+    # Disable with: LINCHINE_SKIP_UPDATE=1 sudo ./linchine.sh --install
+    if [ "${LINCHINE_SKIP_UPDATE:-0}" = "1" ]; then
+        log "Self-update skipped by LINCHINE_SKIP_UPDATE=1."
+        return 0
+    fi
+
+    if [ "${LINCHINE_ALREADY_UPDATED:-0}" = "1" ]; then
+        return 0
+    fi
+
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        log "Self-update skipped because curl/wget is not installed yet."
+        return 0
+    fi
+
+    local self
+    local target
+    local tmp
+
+    self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+    target="/usr/local/sbin/linchine.sh"
+    tmp="$(mktemp /tmp/linchine-update.XXXXXX)"
+
+    if fetch_url "$SELF_UPDATE_URL_MAIN" "$tmp" || fetch_url "$SELF_UPDATE_URL_MASTER" "$tmp"; then
+        if ! grep -q "LINCHINE_USER=" "$tmp" || ! bash -n "$tmp" >/dev/null 2>&1; then
+            log "Self-update downloaded something invalid; ignoring it."
+            rm -f "$tmp"
+            return 0
+        fi
+
+        if [ -f "$target" ] && cmp -s "$tmp" "$target"; then
+            log "Linchine is already up to date."
+            rm -f "$tmp"
+            return 0
+        fi
+
+        log "Update found. Installing updated Linchine script to ${target}..."
+        install -m 755 "$tmp" "$target"
+        rm -f "$tmp"
+
+        if [ "$self" = "$target" ]; then
+            log "Restarting into updated Linchine script..."
+            LINCHINE_ALREADY_UPDATED=1 exec "$target" "$@"
+        fi
+
+        log "Updated installed script. Continuing this run."
+    else
+        log "Self-update check failed or no network is available. Continuing."
+        rm -f "$tmp"
+    fi
+}
 
 install_self() {
     local target="/usr/local/sbin/linchine.sh"
     local source
 
     mkdir -p /usr/local/sbin
-
-    source="$(readlink -f "$0")"
+    source="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
     if [ "$source" != "$target" ]; then
         log "Installing Linchine script to ${target}..."
@@ -157,12 +225,178 @@ EOF
     systemctl enable linchine-firstboot.service || true
 }
 
+write_gpu_helper() {
+    log "Writing GPU helper..."
+
+    cat > /usr/local/bin/linchine-gpu-helper <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+is_supported_high_sierra_nvidia_name() {
+    local name
+    name="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+
+    # Explicitly reject NVIDIA generations that do not have useful macOS High Sierra acceleration.
+    case "$name" in
+        *"rtx"*|*"gtx 16"*|*"gtx1650"*|*"gtx 1650"*|*"gtx1660"*|*"gtx 1660"*|*"titan rtx"*|*"titan v"*|*"quadro rtx"*|*"tesla v"*|*"tesla t4"*|*"a100"*|*"l4"*|*"l40"*|*"rtx a"*)
+            return 1
+            ;;
+    esac
+
+    # Broad auto-allow list for High Sierra-era NVIDIA cards:
+    # Kepler, Maxwell, Pascal, and related Quadro/Tesla K/M/P naming.
+    case "$name" in
+        *"gtx 6"*|*"gt 6"*|*"gtx 7"*|*"gt 7"*|*"gtx 8"*|*"gt 8"*|*"gtx 9"*|*"gtx 10"*|*"quadro k"*|*"quadro m"*|*"quadro p"*|*"tesla k"*|*"tesla m"*|*"tesla p"*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+device_id_for_bdf() {
+    local bdf="$1"
+    lspci -Dnn -s "$bdf" | grep -oE '\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\]' | tail -n1 | tr -d '[]'
+}
+
+audio_for_gpu_bdf() {
+    local gpu_bdf="$1"
+    local base
+    base="${gpu_bdf%.*}"
+
+    if lspci -Dnn -s "${base}.1" 2>/dev/null | grep -Eiq 'audio|hdmi'; then
+        echo "${base}.1"
+    fi
+}
+
+first_supported_nvidia() {
+    local line
+    local bdf
+    local audio
+    local gpu_id
+    local audio_id
+
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+
+        if is_supported_high_sierra_nvidia_name "$line"; then
+            bdf="$(echo "$line" | awk '{print $1}')"
+            audio="$(audio_for_gpu_bdf "$bdf" || true)"
+            gpu_id="$(device_id_for_bdf "$bdf" || true)"
+            audio_id=""
+            if [ -n "$audio" ]; then
+                audio_id="$(device_id_for_bdf "$audio" || true)"
+            fi
+
+            echo "SUPPORTED=yes"
+            echo "GPU_BDF=$bdf"
+            echo "GPU_ID=$gpu_id"
+            echo "AUDIO_BDF=$audio"
+            echo "AUDIO_ID=$audio_id"
+            echo "GPU_NAME=$(echo "$line" | cut -d' ' -f2-)"
+            exit 0
+        fi
+    done < <(lspci -Dnn | grep -Ei 'nvidia.*(vga|3d|display)' || true)
+
+    echo "SUPPORTED=no"
+    exit 1
+}
+
+list_nvidia() {
+    lspci -Dnn | grep -Ei 'nvidia.*(vga|3d|display|audio)' || true
+}
+
+configure_vfio() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "This command must be run as root." >&2
+        exit 1
+    fi
+
+    local ids="$1"
+    local cpu_vendor
+    local iommu_arg
+
+    if [ -z "$ids" ]; then
+        echo "No VFIO IDs were provided." >&2
+        exit 1
+    fi
+
+    cpu_vendor="$(lscpu 2>/dev/null | awk -F: '/Vendor ID/ {gsub(/^[ \t]+/, "", $2); print $2}' || true)"
+    case "$cpu_vendor" in
+        AuthenticAMD)
+            iommu_arg="amd_iommu=on"
+            ;;
+        *)
+            iommu_arg="intel_iommu=on"
+            ;;
+    esac
+
+    modprobe vfio-pci || true
+
+    cat > /etc/modprobe.d/linchine-vfio.conf <<CONF
+options vfio-pci ids=${ids} disable_vga=1
+softdep nouveau pre: vfio-pci
+softdep nvidia pre: vfio-pci
+softdep nvidiafb pre: vfio-pci
+softdep drm pre: vfio-pci
+CONF
+
+    mkdir -p /etc/default/grub.d
+    cat > /etc/default/grub.d/99-linchine-vfio.cfg <<CONF
+GRUB_CMDLINE_LINUX_DEFAULT="\$GRUB_CMDLINE_LINUX_DEFAULT ${iommu_arg} iommu=pt kvm.ignore_msrs=1 vfio-pci.ids=${ids} video=efifb:off"
+CONF
+
+    if command -v update-initramfs >/dev/null 2>&1; then
+        update-initramfs -u || true
+    fi
+
+    if command -v update-grub >/dev/null 2>&1; then
+        update-grub || true
+    elif command -v grub-mkconfig >/dev/null 2>&1; then
+        grub-mkconfig -o /boot/grub/grub.cfg || true
+    fi
+
+    echo "VFIO configuration written for IDs: ${ids}"
+    echo "A reboot is required before passthrough can work."
+}
+
+case "${1:-}" in
+    --list-nvidia)
+        list_nvidia
+        ;;
+    --first-supported-nvidia)
+        first_supported_nvidia
+        ;;
+    --is-supported-name)
+        is_supported_high_sierra_nvidia_name "${2:-}" && echo yes || echo no
+        ;;
+    --configure-vfio)
+        configure_vfio "${2:-}"
+        ;;
+    *)
+        echo "Usage:"
+        echo "  linchine-gpu-helper --list-nvidia"
+        echo "  linchine-gpu-helper --first-supported-nvidia"
+        echo "  linchine-gpu-helper --configure-vfio 10de:xxxx,10de:yyyy"
+        exit 1
+        ;;
+esac
+EOF
+
+    chmod +x /usr/local/bin/linchine-gpu-helper
+}
+
 write_launcher() {
     log "Writing Linchine launcher..."
 
     cat > /usr/local/bin/linchine-launcher <<'EOF'
 #!/bin/bash
 set -euo pipefail
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 LINCHINE_DIR="/opt/linchine"
 CONFIG_FILE="${LINCHINE_DIR}/config/linchine.conf"
@@ -172,12 +406,16 @@ show_error() {
     xterm -fullscreen -e "echo 'Linchine error:'; echo \"$1\"; echo; echo 'Press Enter to open a shell.'; read; bash"
 }
 
+run_setup() {
+    xterm -fullscreen -e /usr/local/bin/linchine-setup
+}
+
 if [ ! -d "$OSX_DIR" ]; then
     xterm -fullscreen -e "echo 'Running Linchine first-boot setup...'; sudo /usr/local/sbin/linchine.sh --firstboot; echo; echo 'Done. Press Enter to continue.'; read"
 fi
 
 if [ ! -f "$CONFIG_FILE" ]; then
-    xterm -fullscreen -e /usr/local/bin/linchine-setup
+    run_setup
 fi
 
 if [ ! -d "$OSX_DIR" ]; then
@@ -185,29 +423,122 @@ if [ ! -d "$OSX_DIR" ]; then
     exit 1
 fi
 
-cd "$OSX_DIR"
-
-if [ ! -f "BaseSystem.img" ]; then
-    xterm -fullscreen -e /usr/local/bin/linchine-setup
+if [ ! -f "${OSX_DIR}/BaseSystem.img" ] || [ ! -f "${OSX_DIR}/mac_hdd_ng.img" ]; then
+    run_setup
 fi
 
-if [ ! -f "mac_hdd_ng.img" ]; then
-    xterm -fullscreen -e /usr/local/bin/linchine-setup
-fi
-
-if [ ! -f "OpenCore-Boot.sh" ]; then
+if [ ! -f "${OSX_DIR}/OpenCore-Boot.sh" ]; then
     show_error "OpenCore-Boot.sh is missing."
     exit 1
 fi
 
-/usr/local/bin/linchine-patch-opencore || true
-
-chmod +x OpenCore-Boot.sh
-
-./OpenCore-Boot.sh
+# Keep a small terminal open with the boot log. If QEMU exits instantly, the user
+# sees the error instead of getting a dead blank desktop.
+xterm -title "Linchine Boot Log" -geometry 110x28+20+20 -e /usr/local/bin/linchine-boot --boot-or-shell
 EOF
 
     chmod +x /usr/local/bin/linchine-launcher
+}
+
+write_boot_command() {
+    log "Writing linchine-boot command..."
+
+    cat > /usr/local/bin/linchine-boot <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+LINCHINE_DIR="/opt/linchine"
+CONFIG_FILE="${LINCHINE_DIR}/config/linchine.conf"
+OSX_DIR="${LINCHINE_DIR}/OSX-KVM-updated"
+BOOT_LOG="/var/log/linchine-boot.log"
+
+mkdir -p "$(dirname "$BOOT_LOG")" 2>/dev/null || true
+
+log() {
+    echo "[Linchine Boot] $*" | tee -a "$BOOT_LOG"
+}
+
+fail_shell() {
+    local status="${1:-1}"
+    echo
+    echo "Linchine boot failed with exit code ${status}."
+    echo
+    echo "Log file: ${BOOT_LOG}"
+    echo
+    echo "Last 80 log lines:"
+    echo "------------------------------------------------------------"
+    tail -n 80 "$BOOT_LOG" 2>/dev/null || true
+    echo "------------------------------------------------------------"
+    echo
+    echo "Press Enter to open a shell."
+    read -r _ || true
+    exec bash
+}
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "Missing config: $CONFIG_FILE"
+    echo "Run: linchine-setup"
+    exit 1
+fi
+
+if [ ! -d "$OSX_DIR" ]; then
+    echo "Missing VM folder: $OSX_DIR"
+    echo "Run: sudo /usr/local/sbin/linchine.sh --firstboot"
+    exit 1
+fi
+
+source "$CONFIG_FILE"
+
+cd "$OSX_DIR"
+
+if [ ! -f "BaseSystem.img" ]; then
+    echo "Missing BaseSystem.img. Run: linchine-setup"
+    exit 1
+fi
+
+if [ ! -f "mac_hdd_ng.img" ]; then
+    echo "Missing mac_hdd_ng.img. Run: linchine-setup"
+    exit 1
+fi
+
+: > "$BOOT_LOG" || true
+log "Starting Linchine boot."
+log "macOS product: ${MACOS_PRODUCT:-unknown}"
+log "RAM_MB: ${RAM_MB:-unknown}"
+log "CPU_CORES: ${CPU_CORES:-unknown}"
+log "GPU_PASSTHROUGH: ${GPU_PASSTHROUGH:-no}"
+
+if [ "${GPU_PASSTHROUGH:-no}" = "yes" ]; then
+    if [ ! -f "boot-passthrough.sh" ]; then
+        log "GPU passthrough is enabled, but boot-passthrough.sh is missing."
+        fail_shell 1
+    fi
+
+    /usr/local/bin/linchine-patch-passthrough || true
+
+    if [ -f "boot-linchine-passthrough.sh" ]; then
+        chmod +x boot-linchine-passthrough.sh
+        log "Booting QEMU with NVIDIA passthrough using boot-linchine-passthrough.sh."
+        log "If your monitor is attached to the passthrough GPU, output should appear there."
+        bash ./boot-linchine-passthrough.sh >> "$BOOT_LOG" 2>&1 || fail_shell "$?"
+    else
+        chmod +x boot-passthrough.sh
+        log "Booting QEMU with passthrough using boot-passthrough.sh."
+        bash ./boot-passthrough.sh >> "$BOOT_LOG" 2>&1 || fail_shell "$?"
+    fi
+else
+    /usr/local/bin/linchine-patch-opencore || true
+    chmod +x OpenCore-Boot.sh
+    log "Booting QEMU using OpenCore-Boot.sh."
+    bash ./OpenCore-Boot.sh >> "$BOOT_LOG" 2>&1 || fail_shell "$?"
+fi
+
+log "QEMU exited normally."
+EOF
+
+    chmod +x /usr/local/bin/linchine-boot
 }
 
 write_patch_opencore() {
@@ -216,6 +547,8 @@ write_patch_opencore() {
     cat > /usr/local/bin/linchine-patch-opencore <<'EOF'
 #!/bin/bash
 set -euo pipefail
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 LINCHINE_DIR="/opt/linchine"
 CONFIG_FILE="${LINCHINE_DIR}/config/linchine.conf"
@@ -237,7 +570,7 @@ RAM_MB="${RAM_MB:-8192}"
 CPU_CORES="${CPU_CORES:-4}"
 
 if grep -Eq '^ALLOCATED_RAM=' "$BOOT_SCRIPT"; then
-    sed -i -E "s/^ALLOCATED_RAM=.*/ALLOCATED_RAM=\"${RAM_MB}\"/g" "$BOOT_SCRIPT"
+    sed -i -E "s/^ALLOCATED_RAM=.*/ALLOCATED_RAM=\"${RAM_MB}\" # MiB/g" "$BOOT_SCRIPT"
 fi
 
 if grep -Eq '^CPU_CORES=' "$BOOT_SCRIPT"; then
@@ -256,12 +589,90 @@ if grep -Eq -- "-smp [0-9]+" "$BOOT_SCRIPT"; then
     sed -i -E "s/-smp [0-9]+[^ ]*/-smp ${CPU_CORES},cores=${CPU_CORES}/g" "$BOOT_SCRIPT"
 fi
 
+# Make sure the normal non-passthrough boot opens a visible fullscreen GTK window.
 if grep -q -- "-display gtk" "$BOOT_SCRIPT"; then
     sed -i -E 's/-display gtk[^ \\]*/-display gtk,full-screen=on,zoom-to-fit=on,show-menubar=off/g' "$BOOT_SCRIPT"
+elif ! grep -q -- "-display " "$BOOT_SCRIPT"; then
+    # Insert a display line before vmware-svga in args=(...) based scripts.
+    sed -i '/-device vmware-svga/i\  -display gtk,full-screen=on,zoom-to-fit=on,show-menubar=off' "$BOOT_SCRIPT"
 fi
 EOF
 
     chmod +x /usr/local/bin/linchine-patch-opencore
+}
+
+write_patch_passthrough() {
+    log "Writing passthrough patch helper..."
+
+    cat > /usr/local/bin/linchine-patch-passthrough <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+LINCHINE_DIR="/opt/linchine"
+CONFIG_FILE="${LINCHINE_DIR}/config/linchine.conf"
+OSX_DIR="${LINCHINE_DIR}/OSX-KVM-updated"
+SOURCE_SCRIPT="${OSX_DIR}/boot-passthrough.sh"
+OUT_SCRIPT="${OSX_DIR}/boot-linchine-passthrough.sh"
+
+[ -f "$SOURCE_SCRIPT" ] || exit 0
+[ -f "$CONFIG_FILE" ] || exit 0
+
+source "$CONFIG_FILE"
+
+[ "${GPU_PASSTHROUGH:-no}" = "yes" ] || exit 0
+[ -n "${GPU_BDF:-}" ] || exit 0
+
+RAM_MB="${RAM_MB:-8192}"
+CPU_CORES="${CPU_CORES:-4}"
+AUDIO_BDF="${AUDIO_BDF:-}"
+
+cd "$OSX_DIR"
+
+cp "$SOURCE_SCRIPT" "$OUT_SCRIPT"
+
+if grep -Eq '^ALLOCATED_RAM=' "$OUT_SCRIPT"; then
+    sed -i -E "s/^ALLOCATED_RAM=.*/ALLOCATED_RAM=\"${RAM_MB}\" # MiB/g" "$OUT_SCRIPT"
+fi
+
+if grep -Eq '^CPU_CORES=' "$OUT_SCRIPT"; then
+    sed -i -E "s/^CPU_CORES=.*/CPU_CORES=\"${CPU_CORES}\"/g" "$OUT_SCRIPT"
+fi
+
+if grep -Eq '^CPU_THREADS=' "$OUT_SCRIPT"; then
+    sed -i -E "s/^CPU_THREADS=.*/CPU_THREADS=\"${CPU_CORES}\"/g" "$OUT_SCRIPT"
+fi
+
+if [ -f "OVMF_CODE_4M.fd" ]; then
+    sed -i 's/OVMF_CODE.fd/OVMF_CODE_4M.fd/g' "$OUT_SCRIPT"
+fi
+
+if [ -f "OVMF_VARS-1920x1080.fd" ]; then
+    sed -i 's/OVMF_VARS-1024x768.fd/OVMF_VARS-1920x1080.fd/g' "$OUT_SCRIPT"
+fi
+
+# Replace the first passthrough GPU line and optional audio line.
+awk -v gpu="$GPU_BDF" -v audio="$AUDIO_BDF" '
+BEGIN { gpu_done=0; audio_done=0 }
+/-device vfio-pci,host=.*multifunction=on/ && gpu_done==0 {
+    print "  -device vfio-pci,host=" gpu ",multifunction=on,x-no-kvm-intx=on"
+    gpu_done=1
+    next
+}
+/-device vfio-pci,host=.*01:00\.1/ && audio_done==0 {
+    if (audio != "") print "  -device vfio-pci,host=" audio
+    audio_done=1
+    next
+}
+{ print }
+' "$OUT_SCRIPT" > "${OUT_SCRIPT}.tmp"
+
+mv "${OUT_SCRIPT}.tmp" "$OUT_SCRIPT"
+chmod +x "$OUT_SCRIPT"
+EOF
+
+    chmod +x /usr/local/bin/linchine-patch-passthrough
 }
 
 write_setup_wizard() {
@@ -270,6 +681,8 @@ write_setup_wizard() {
     cat > /usr/local/bin/linchine-setup <<'EOF'
 #!/bin/bash
 set -euo pipefail
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 LINCHINE_DIR="/opt/linchine"
 CONFIG_DIR="${LINCHINE_DIR}/config"
@@ -380,6 +793,56 @@ show_qemu_version_warning() {
     whiptail --title "QEMU Version" --msgbox "Detected:\n${qemu_version}\n\nQEMU 8.2.2 or newer is recommended.\nIf booting fails, try a newer Debian release or newer QEMU package." 13 76
 }
 
+detect_supported_nvidia_passthrough() {
+    local detection
+    local ids
+    local gpu_bdf
+    local audio_bdf
+    local gpu_id
+    local audio_id
+    local gpu_name
+
+    GPU_PASSTHROUGH="no"
+    GPU_BDF=""
+    AUDIO_BDF=""
+    GPU_ID=""
+    AUDIO_ID=""
+
+    [ "$MACOS_PRODUCT" = "1" ] || return 0
+    command -v linchine-gpu-helper >/dev/null 2>&1 || return 0
+
+    detection="$(linchine-gpu-helper --first-supported-nvidia 2>/dev/null || true)"
+    echo "$detection" | grep -q '^SUPPORTED=yes' || return 0
+
+    gpu_bdf="$(echo "$detection" | awk -F= '/^GPU_BDF=/ {print $2; exit}')"
+    audio_bdf="$(echo "$detection" | awk -F= '/^AUDIO_BDF=/ {print $2; exit}')"
+    gpu_id="$(echo "$detection" | awk -F= '/^GPU_ID=/ {print $2; exit}')"
+    audio_id="$(echo "$detection" | awk -F= '/^AUDIO_ID=/ {print $2; exit}')"
+    gpu_name="$(echo "$detection" | awk -F= '/^GPU_NAME=/ {$1=""; sub(/^=/,""); print; exit}')"
+
+    if [ -z "$gpu_bdf" ] || [ -z "$gpu_id" ]; then
+        return 0
+    fi
+
+    if [ -n "$audio_id" ]; then
+        ids="${gpu_id},${audio_id}"
+    else
+        ids="${gpu_id}"
+    fi
+
+    if whiptail --title "NVIDIA High Sierra Passthrough" --yesno "Linchine detected a likely High Sierra-compatible NVIDIA GPU:\n\n${gpu_name}\n\nGPU: ${gpu_bdf} (${gpu_id})\nAudio: ${audio_bdf:-none} ${audio_id:-}\n\nEnable GPU passthrough mode?\n\nImportant:\n- Use this after installing macOS normally first.\n- Your monitor should be connected to this NVIDIA card.\n- A reboot is required after VFIO setup.\n- High Sierra may still need NVIDIA Web Drivers inside macOS." 22 78; then
+        GPU_PASSTHROUGH="yes"
+        GPU_BDF="$gpu_bdf"
+        AUDIO_BDF="$audio_bdf"
+        GPU_ID="$gpu_id"
+        AUDIO_ID="$audio_id"
+
+        sudo linchine-gpu-helper --configure-vfio "$ids" || true
+
+        whiptail --title "Reboot Required" --msgbox "GPU passthrough mode has been enabled in Linchine.\n\nVFIO/IOMMU settings were written for:\n${ids}\n\nReboot before trying passthrough.\n\nAfter reboot, use:\nlinchine-boot\n\nIf passthrough fails, edit:\n${CONFIG_FILE}\n\nand set:\nGPU_PASSTHROUGH=\"no\"" 17 76
+    fi
+}
+
 need_whiptail
 
 whiptail --title "Linchine Setup" --msgbox "Welcome to Linchine.\n\nThis will prepare a macOS virtual machine using QEMU/KVM and OpenCore.\n\nIt will NOT erase your real system disk. It only creates a qcow2 virtual disk file for macOS." 15 76
@@ -407,7 +870,7 @@ while true; do
     "4" "Big Sur (11.7)" \
     "3" "Catalina (10.15)" \
     "2" "Mojave (10.14)" \
-    "1" "High Sierra (10.13) - best for modern NVIDIA acceleration" \
+    "1" "High Sierra (10.13) - best for supported NVIDIA passthrough" \
     "manual" "I will add BaseSystem.img manually later" \
     3>&1 1>&2 2>&3) || cancelled
 
@@ -460,11 +923,23 @@ CPU_CORES=$(whiptail --title "macOS CPU" --menu "How many CPU cores should macOS
 "8" "High-end" \
 3>&1 1>&2 2>&3) || cancelled
 
+GPU_PASSTHROUGH="no"
+GPU_BDF=""
+AUDIO_BDF=""
+GPU_ID=""
+AUDIO_ID=""
+detect_supported_nvidia_passthrough
+
 cat > "$CONFIG_FILE" <<CONF
 MACOS_PRODUCT="$MACOS_PRODUCT"
 DISK_SIZE="$DISK_SIZE"
 RAM_MB="$RAM_MB"
 CPU_CORES="$CPU_CORES"
+GPU_PASSTHROUGH="$GPU_PASSTHROUGH"
+GPU_BDF="$GPU_BDF"
+AUDIO_BDF="$AUDIO_BDF"
+GPU_ID="$GPU_ID"
+AUDIO_ID="$AUDIO_ID"
 CONF
 
 cd "$OSX_DIR"
@@ -505,8 +980,9 @@ if [ "$MACOS_PRODUCT" != "manual" ]; then
 fi
 
 /usr/local/bin/linchine-patch-opencore || true
+/usr/local/bin/linchine-patch-passthrough || true
 
-whiptail --title "Linchine Ready" --msgbox "Setup complete.\n\nLinchine will now boot OpenCore/macOS fullscreen." 11 70
+whiptail --title "Linchine Ready" --msgbox "Setup complete.\n\nTo boot manually, run:\nlinchine-boot\n\nLinchine will now boot OpenCore/macOS." 13 70
 EOF
 
     chmod +x /usr/local/bin/linchine-setup
@@ -555,12 +1031,21 @@ firstboot_clone_osx_kvm() {
         sudo -u "$LINCHINE_USER" git clone --depth 1 --recursive "$OSX_REPO" "$OSX_DIR"
     else
         log "OSX-KVM-updated already exists."
+        if [ -d "${OSX_DIR}/.git" ]; then
+            log "Updating OSX-KVM-updated..."
+            sudo -u "$LINCHINE_USER" git -C "$OSX_DIR" pull --ff-only || true
+            sudo -u "$LINCHINE_USER" git -C "$OSX_DIR" submodule update --init --recursive || true
+        fi
     fi
 
     chown -R "$LINCHINE_USER:$LINCHINE_USER" "$LINCHINE_DIR"
 
     if [ -f "${OSX_DIR}/OpenCore-Boot.sh" ]; then
         chmod +x "${OSX_DIR}/OpenCore-Boot.sh"
+    fi
+
+    if [ -f "${OSX_DIR}/boot-passthrough.sh" ]; then
+        chmod +x "${OSX_DIR}/boot-passthrough.sh"
     fi
 }
 
@@ -570,6 +1055,7 @@ install_mode() {
 
     log "Starting Linchine install mode..."
 
+    run_self_update "$@"
     install_self
     ensure_user
     configure_autologin
@@ -578,12 +1064,16 @@ install_mode() {
     mkdir -p "$LINCHINE_CONFIG_DIR"
     chown -R "$LINCHINE_USER:$LINCHINE_USER" "$LINCHINE_DIR"
 
+    write_gpu_helper
     write_launcher
+    write_boot_command
     write_patch_opencore
+    write_patch_passthrough
     write_setup_wizard
     write_firstboot_service
 
     log "Linchine install mode complete."
+    log "After setup, users can boot manually with: linchine-boot"
 }
 
 firstboot_mode() {
@@ -592,6 +1082,7 @@ firstboot_mode() {
 
     log "Starting Linchine first-boot mode..."
 
+    run_self_update "$@"
     configure_kvm
     firstboot_clone_osx_kvm
 
@@ -602,13 +1093,23 @@ firstboot_mode() {
 
 case "${1:-}" in
     --install)
-        install_mode
+        install_mode "$@"
         ;;
     --firstboot)
-        firstboot_mode
+        firstboot_mode "$@"
+        ;;
+    --no-update-install)
+        LINCHINE_SKIP_UPDATE=1 install_mode "$@"
+        ;;
+    --no-update-firstboot)
+        LINCHINE_SKIP_UPDATE=1 firstboot_mode "$@"
         ;;
     *)
         echo "Usage: $0 --install | --firstboot"
+        echo
+        echo "Environment options:"
+        echo "  LINCHINE_SKIP_UPDATE=1    Disable automatic self-update"
+        echo "  LINCHINE_SELF_UPDATE_URL=  Override update URL"
         exit 1
         ;;
 esac
