@@ -1,32 +1,18 @@
 #!/bin/bash
 set -euo pipefail
 
-### Linchine installer/control script
-###
-### Modes:
-###   linchine.sh --install
-###   linchine.sh --firstboot
-###
-### Expected install path after preseed:
-###   /usr/local/sbin/linchine.sh
-
 LINCHINE_USER="linchine"
 LINCHINE_HOME="/home/${LINCHINE_USER}"
-
 LINCHINE_DIR="/opt/linchine"
 LINCHINE_CONFIG_DIR="${LINCHINE_DIR}/config"
 LINCHINE_CONFIG="${LINCHINE_CONFIG_DIR}/linchine.conf"
-
-OSX_DIR="${LINCHINE_DIR}/OSX-KVM"
-OSX_REPO="${OSX_REPO:-https://github.com/kholia/OSX-KVM.git}"
-
+OSX_DIR="${LINCHINE_DIR}/OSX-KVM-updated"
+OSX_REPO="${OSX_REPO:-https://github.com/renatus777rr/OSX-KVM-updated.git}"
 LOG_FILE="/var/log/linchine-install.log"
-
 
 log() {
     echo "[Linchine] $*" | tee -a "$LOG_FILE"
 }
-
 
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -34,7 +20,6 @@ require_root() {
         exit 1
     fi
 }
-
 
 ensure_user() {
     log "Configuring Linchine user..."
@@ -60,18 +45,14 @@ ensure_user() {
     mkdir -p "$LINCHINE_HOME"
     chown "$LINCHINE_USER:$LINCHINE_USER" "$LINCHINE_HOME"
 
-    ### Lock the weak preseed password.
-    ### Linchine uses local auto-login instead.
     passwd -l "$LINCHINE_USER" >/dev/null 2>&1 || true
 
-    ### Appliance-style sudo.
-    ### Needed because password login is locked.
     cat > /etc/sudoers.d/linchine <<EOF
 ${LINCHINE_USER} ALL=(ALL) NOPASSWD:ALL
 EOF
+
     chmod 0440 /etc/sudoers.d/linchine
 }
-
 
 configure_autologin() {
     log "Configuring tty1 auto-login..."
@@ -86,7 +67,6 @@ EOF
 
     systemctl daemon-reload || true
 }
-
 
 configure_startx() {
     log "Configuring automatic startx..."
@@ -114,7 +94,6 @@ EOF
     chmod +x "${LINCHINE_HOME}/.xinitrc"
 }
 
-
 write_firstboot_service() {
     log "Writing first-boot service..."
 
@@ -136,7 +115,6 @@ EOF
     systemctl enable linchine-firstboot.service || true
 }
 
-
 write_launcher() {
     log "Writing Linchine launcher..."
 
@@ -146,7 +124,7 @@ set -euo pipefail
 
 LINCHINE_DIR="/opt/linchine"
 CONFIG_FILE="${LINCHINE_DIR}/config/linchine.conf"
-OSX_DIR="${LINCHINE_DIR}/OSX-KVM"
+OSX_DIR="${LINCHINE_DIR}/OSX-KVM-updated"
 
 show_error() {
     xterm -fullscreen -e "echo 'Linchine error:'; echo \"$1\"; echo; echo 'Press Enter to open a shell.'; read; bash"
@@ -161,7 +139,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 if [ ! -d "$OSX_DIR" ]; then
-    show_error "OSX-KVM folder is missing. Check internet connection, then run: sudo /usr/local/sbin/linchine.sh --firstboot"
+    show_error "OSX-KVM-updated folder is missing. Check internet connection, then run: sudo /usr/local/sbin/linchine.sh --firstboot"
     exit 1
 fi
 
@@ -190,7 +168,6 @@ EOF
     chmod +x /usr/local/bin/linchine-launcher
 }
 
-
 write_patch_opencore() {
     log "Writing OpenCore patch helper..."
 
@@ -200,7 +177,7 @@ set -euo pipefail
 
 LINCHINE_DIR="/opt/linchine"
 CONFIG_FILE="${LINCHINE_DIR}/config/linchine.conf"
-OSX_DIR="${LINCHINE_DIR}/OSX-KVM"
+OSX_DIR="${LINCHINE_DIR}/OSX-KVM-updated"
 BOOT_SCRIPT="${OSX_DIR}/OpenCore-Boot.sh"
 
 [ -f "$BOOT_SCRIPT" ] || exit 0
@@ -212,13 +189,11 @@ if [ ! -f "${BOOT_SCRIPT}.linchine.bak" ]; then
     cp "$BOOT_SCRIPT" "${BOOT_SCRIPT}.linchine.bak"
 fi
 
-# shellcheck disable=SC1090
 source "$CONFIG_FILE"
 
 RAM_MB="${RAM_MB:-8192}"
 CPU_CORES="${CPU_CORES:-4}"
 
-### Patch common OSX-KVM variables if present.
 if grep -Eq '^ALLOCATED_RAM=' "$BOOT_SCRIPT"; then
     sed -i -E "s/^ALLOCATED_RAM=.*/ALLOCATED_RAM=\"${RAM_MB}\"/g" "$BOOT_SCRIPT"
 fi
@@ -231,17 +206,14 @@ if grep -Eq '^CPU_THREADS=' "$BOOT_SCRIPT"; then
     sed -i -E "s/^CPU_THREADS=.*/CPU_THREADS=\"${CPU_CORES}\"/g" "$BOOT_SCRIPT"
 fi
 
-### Patch simple command-line RAM if present.
 if grep -Eq -- "-m [0-9]+" "$BOOT_SCRIPT"; then
     sed -i -E "s/-m [0-9]+/-m ${RAM_MB}/g" "$BOOT_SCRIPT"
 fi
 
-### Patch simple command-line CPU if present.
 if grep -Eq -- "-smp [0-9]+" "$BOOT_SCRIPT"; then
     sed -i -E "s/-smp [0-9]+[^ ]*/-smp ${CPU_CORES},cores=${CPU_CORES}/g" "$BOOT_SCRIPT"
 fi
 
-### Fullscreen + stretch-to-fit GTK display.
 if grep -q -- "-display gtk" "$BOOT_SCRIPT"; then
     sed -i -E 's/-display gtk[^ \\]*/-display gtk,full-screen=on,zoom-to-fit=on,show-menubar=off/g' "$BOOT_SCRIPT"
 fi
@@ -249,7 +221,6 @@ EOF
 
     chmod +x /usr/local/bin/linchine-patch-opencore
 }
-
 
 write_setup_wizard() {
     log "Writing Linchine setup wizard..."
@@ -261,7 +232,7 @@ set -euo pipefail
 LINCHINE_DIR="/opt/linchine"
 CONFIG_DIR="${LINCHINE_DIR}/config"
 CONFIG_FILE="${CONFIG_DIR}/linchine.conf"
-OSX_DIR="${LINCHINE_DIR}/OSX-KVM"
+OSX_DIR="${LINCHINE_DIR}/OSX-KVM-updated"
 
 mkdir -p "$CONFIG_DIR"
 
@@ -301,7 +272,7 @@ check_cpu_requirements() {
     fi
 
     if ! cpu_has_flag "sse4_1"; then
-        whiptail --title "SSE4.1 Missing" --msgbox "This CPU does not show SSE4.1 support.\n\nOSX-KVM notes say SSE4.1 is required for macOS Sierra and newer." 12 72
+        whiptail --title "SSE4.1 Missing" --msgbox "This CPU does not show SSE4.1 support.\n\nSSE4.1 is required for macOS Sierra and newer." 12 72
         cancelled
     fi
 }
@@ -312,18 +283,59 @@ check_avx2_for_modern_macos() {
     case "$product" in
         6|7|8|9)
             if ! cpu_has_flag "avx2"; then
-                whiptail --title "AVX2 Missing" --msgbox "This CPU does not show AVX2 support.\n\nOSX-KVM notes say AVX2 is required for macOS Ventura and newer.\n\nChoose Monterey or older instead." 14 72
+                whiptail --title "AVX2 Missing" --msgbox "This CPU does not show AVX2 support.\n\nAVX2 is required for macOS Ventura and newer.\n\nChoose Monterey or older instead." 14 72
                 cancelled
             fi
             ;;
     esac
 }
 
+gpu_lines() {
+    if command -v lspci >/dev/null 2>&1; then
+        lspci | grep -Ei 'vga|3d|display' || true
+    else
+        true
+    fi
+}
+
+has_nvidia_gpu() {
+    gpu_lines | grep -Eiq 'nvidia'
+}
+
+has_non_nvidia_gpu() {
+    gpu_lines | grep -Eiv 'nvidia' | grep -Eiq 'intel|amd|ati|radeon'
+}
+
+warn_about_nvidia_if_needed() {
+    local product="$1"
+
+    case "$product" in
+        1|manual)
+            return 0
+            ;;
+    esac
+
+    if ! has_nvidia_gpu; then
+        return 0
+    fi
+
+    local detected_gpus
+    detected_gpus="$(gpu_lines)"
+
+    if has_non_nvidia_gpu; then
+        whiptail --title "Modern NVIDIA Warning" --yesno "Linchine detected an NVIDIA GPU.\n\nDetected graphics devices:\n\n${detected_gpus}\n\nModern NVIDIA GPUs generally only have proper macOS GPU acceleration on High Sierra.\n\nFor Mojave or newer, use integrated graphics or another compatible non-NVIDIA GPU for passthrough.\n\nIf you continue with this macOS version, graphics may be slow or unaccelerated.\n\nContinue anyway?" 22 78
+        return $?
+    else
+        whiptail --title "NVIDIA-Only System Warning" --yesno "Linchine detected an NVIDIA GPU, but no obvious integrated/non-NVIDIA graphics device.\n\nDetected graphics devices:\n\n${detected_gpus}\n\nModern NVIDIA GPUs generally only have proper macOS GPU acceleration on High Sierra.\n\nIf you install Mojave or newer on an NVIDIA-only system, macOS graphics may be very slow or unaccelerated.\n\nRecommended choice: High Sierra.\n\nContinue anyway?" 23 78
+        return $?
+    fi
+}
+
 show_qemu_version_warning() {
     local qemu_version
     qemu_version="$(qemu-system-x86_64 --version 2>/dev/null | head -n1 || true)"
 
-    whiptail --title "QEMU Version" --msgbox "Detected:\n${qemu_version}\n\nOSX-KVM recommends QEMU 8.2.2 or newer.\nIf booting fails, try a newer Debian release or newer QEMU package." 13 76
+    whiptail --title "QEMU Version" --msgbox "Detected:\n${qemu_version}\n\nQEMU 8.2.2 or newer is recommended.\nIf booting fails, try a newer Debian release or newer QEMU package." 13 76
 }
 
 need_whiptail
@@ -331,30 +343,38 @@ need_whiptail
 whiptail --title "Linchine Setup" --msgbox "Welcome to Linchine.\n\nThis will prepare a macOS virtual machine using QEMU/KVM and OpenCore.\n\nIt will NOT erase your real system disk. It only creates a qcow2 virtual disk file for macOS." 15 76
 
 if [ ! -d "$OSX_DIR" ]; then
-    whiptail --title "Missing OSX-KVM" --msgbox "The OSX-KVM repo is missing.\n\nLinchine will try to run first-boot setup now." 10 70
+    whiptail --title "Missing OSX-KVM-updated" --msgbox "The OSX-KVM-updated repo is missing.\n\nLinchine will try to run first-boot setup now." 10 70
     sudo /usr/local/sbin/linchine.sh --firstboot
 fi
 
 if [ ! -d "$OSX_DIR" ]; then
-    whiptail --title "Setup Error" --msgbox "OSX-KVM still could not be found.\nCheck your internet connection and try again." 10 70
+    whiptail --title "Setup Error" --msgbox "OSX-KVM-updated still could not be found.\nCheck your internet connection and try again." 10 70
     cancelled
 fi
 
 check_cpu_requirements
 show_qemu_version_warning
 
-MACOS_PRODUCT=$(whiptail --title "macOS Recovery" --menu "Choose macOS version:" 20 78 10 \
-"7" "Sonoma (14) - recommended by OSX-KVM README" \
-"8" "Sequoia (15)" \
-"9" "Tahoe (26)" \
-"6" "Ventura (13) - requires AVX2" \
-"5" "Monterey (12.6)" \
-"4" "Big Sur (11.7)" \
-"3" "Catalina (10.15)" \
-"2" "Mojave (10.14)" \
-"1" "High Sierra (10.13)" \
-"manual" "I will add BaseSystem.img manually later" \
-3>&1 1>&2 2>&3) || cancelled
+while true; do
+    MACOS_PRODUCT=$(whiptail --title "macOS Recovery" --menu "Choose macOS version:" 20 78 10 \
+    "7" "Sonoma (14)" \
+    "8" "Sequoia (15)" \
+    "9" "Tahoe (26)" \
+    "6" "Ventura (13)" \
+    "5" "Monterey (12.6)" \
+    "4" "Big Sur (11.7)" \
+    "3" "Catalina (10.15)" \
+    "2" "Mojave (10.14)" \
+    "1" "High Sierra (10.13) - best for modern NVIDIA acceleration" \
+    "manual" "I will add BaseSystem.img manually later" \
+    3>&1 1>&2 2>&3) || cancelled
+
+    if warn_about_nvidia_if_needed "$MACOS_PRODUCT"; then
+        break
+    else
+        whiptail --title "Choose Again" --msgbox "Choose High Sierra, or choose another macOS version and accept the warning." 10 68
+    fi
+done
 
 if [ "$MACOS_PRODUCT" != "manual" ]; then
     check_avx2_for_modern_macos "$MACOS_PRODUCT"
@@ -363,8 +383,8 @@ fi
 DISK_SIZE=$(whiptail --title "macOS Storage" --menu "How much storage should macOS get?" 18 76 6 \
 "80G" "Minimum comfortable size" \
 "128G" "Good default" \
-"256G" "OSX-KVM README-style size" \
-"512G" "Large" \
+"256G" "Large" \
+"512G" "Very large" \
 "custom" "Type a custom size" \
 3>&1 1>&2 2>&3) || cancelled
 
@@ -423,8 +443,11 @@ if [ "$MACOS_PRODUCT" != "manual" ]; then
 
         chmod +x ./fetch-macOS-v2.py
 
-        ### OSX-KVM downloader is interactive, so we pipe the selected number.
-        printf "%s\n" "$MACOS_PRODUCT" | ./fetch-macOS-v2.py
+        if python3 fetch-macOS-v2.py --help 2>&1 | grep -q -- "--action"; then
+            sudo python3 fetch-macOS-v2.py --action download --os-type default
+        else
+            printf "%s\n" "$MACOS_PRODUCT" | python3 ./fetch-macOS-v2.py
+        fi
 
         if [ -f "BaseSystem.dmg" ]; then
             whiptail --title "Converting Recovery" --infobox "Converting BaseSystem.dmg to BaseSystem.img..." 8 72
@@ -446,7 +469,6 @@ EOF
 
     chmod +x /usr/local/bin/linchine-setup
 }
-
 
 configure_kvm() {
     log "Configuring KVM ignore_msrs..."
@@ -480,18 +502,17 @@ EOF
     esac
 }
 
-
 firstboot_clone_osx_kvm() {
-    log "Preparing OSX-KVM..."
+    log "Preparing OSX-KVM-updated..."
 
     mkdir -p "$LINCHINE_DIR"
     chown -R "$LINCHINE_USER:$LINCHINE_USER" "$LINCHINE_DIR"
 
     if [ ! -d "$OSX_DIR" ]; then
-        log "Cloning OSX-KVM from $OSX_REPO"
+        log "Cloning OSX-KVM-updated from $OSX_REPO"
         sudo -u "$LINCHINE_USER" git clone --depth 1 --recursive "$OSX_REPO" "$OSX_DIR"
     else
-        log "OSX-KVM already exists."
+        log "OSX-KVM-updated already exists."
     fi
 
     chown -R "$LINCHINE_USER:$LINCHINE_USER" "$LINCHINE_DIR"
@@ -500,7 +521,6 @@ firstboot_clone_osx_kvm() {
         chmod +x "${OSX_DIR}/OpenCore-Boot.sh"
     fi
 }
-
 
 install_mode() {
     require_root
@@ -522,7 +542,6 @@ install_mode() {
     log "Linchine install mode complete."
 }
 
-
 firstboot_mode() {
     require_root
 
@@ -535,7 +554,6 @@ firstboot_mode() {
 
     log "Linchine first-boot mode complete."
 }
-
 
 case "${1:-}" in
     --install)
