@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
 LINCHINE_USER="linchine"
 LINCHINE_HOME="/home/${LINCHINE_USER}"
 LINCHINE_DIR="/opt/linchine"
@@ -20,6 +22,30 @@ require_root() {
         exit 1
     fi
 }
+
+check_required_admin_commands() {
+    local missing=""
+    local cmd
+
+    for cmd in useradd usermod passwd getent install systemctl agetty; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing="${missing} ${cmd}"
+        fi
+    done
+
+    if [ -n "$missing" ]; then
+        echo "Linchine is missing required admin commands:${missing}"
+        echo
+        echo "On Debian, install or reinstall the required base packages with:"
+        echo "  apt update"
+        echo "  apt install --reinstall -y passwd login coreutils systemd"
+        echo
+        echo "Current PATH is:"
+        echo "  $PATH"
+        exit 1
+    fi
+}
+
 
 install_self() {
     local target="/usr/local/sbin/linchine.sh"
@@ -540,6 +566,7 @@ firstboot_clone_osx_kvm() {
 
 install_mode() {
     require_root
+    check_required_admin_commands
 
     log "Starting Linchine install mode..."
 
@@ -561,6 +588,7 @@ install_mode() {
 
 firstboot_mode() {
     require_root
+    check_required_admin_commands
 
     log "Starting Linchine first-boot mode..."
 
