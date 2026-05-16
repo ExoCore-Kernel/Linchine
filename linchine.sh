@@ -1178,8 +1178,24 @@ if [ "$MACOS_PRODUCT" != "manual" ]; then
 
         chmod +x ./fetch-macOS-v2.py
 
-        if python3 fetch-macOS-v2.py --help 2>&1 | grep -q -- "--action"; then
-            sudo python3 fetch-macOS-v2.py --action download --os-type default
+        case "$MACOS_PRODUCT" in
+            1) MACOS_SHORTNAME="high-sierra" ;;
+            2) MACOS_SHORTNAME="mojave" ;;
+            3) MACOS_SHORTNAME="catalina" ;;
+            4) MACOS_SHORTNAME="big-sur" ;;
+            5) MACOS_SHORTNAME="monterey" ;;
+            6) MACOS_SHORTNAME="ventura" ;;
+            7) MACOS_SHORTNAME="sonoma" ;;
+            8) MACOS_SHORTNAME="sequoia" ;;
+            9) MACOS_SHORTNAME="tahoe" ;;
+            *) MACOS_SHORTNAME="" ;;
+        esac
+
+        rm -f BaseSystem.img BaseSystem.dmg RecoveryImage.dmg InstallESD.dmg *.chunklist || true
+        rm -rf com.apple.recovery.boot || true
+
+        if [ -n "$MACOS_SHORTNAME" ] && python3 ./fetch-macOS-v2.py --help 2>&1 | grep -q -- "--shortname"; then
+            python3 ./fetch-macOS-v2.py --shortname "$MACOS_SHORTNAME"
         else
             printf "%s\n" "$MACOS_PRODUCT" | python3 ./fetch-macOS-v2.py
         fi
