@@ -21,6 +21,22 @@ require_root() {
     fi
 }
 
+install_self() {
+    local target="/usr/local/sbin/linchine.sh"
+    local source
+
+    mkdir -p /usr/local/sbin
+
+    source="$(readlink -f "$0")"
+
+    if [ "$source" != "$target" ]; then
+        log "Installing Linchine script to ${target}..."
+        install -m 755 "$source" "$target"
+    else
+        chmod 755 "$target"
+    fi
+}
+
 ensure_user() {
     log "Configuring Linchine user..."
 
@@ -527,6 +543,7 @@ install_mode() {
 
     log "Starting Linchine install mode..."
 
+    install_self
     ensure_user
     configure_autologin
     configure_startx
