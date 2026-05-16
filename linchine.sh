@@ -3,6 +3,8 @@ set -euo pipefail
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
+LINCHINE_SCRIPT_VERSION="2026.05.16-fix-xorg-boot"
+
 LINCHINE_USER="linchine"
 LINCHINE_HOME="/home/${LINCHINE_USER}"
 LINCHINE_DIR="/opt/linchine"
@@ -94,13 +96,28 @@ run_self_update() {
             return 0
         fi
 
+        local downloaded_version
+        downloaded_version="$(grep -E '^LINCHINE_SCRIPT_VERSION=' "$tmp" | head -n1 | cut -d= -f2- | tr -d '"' || true)"
+
+        if [ -z "$downloaded_version" ]; then
+            log "Self-update skipped because the online script has no LINCHINE_SCRIPT_VERSION marker."
+            rm -f "$tmp"
+            return 0
+        fi
+
+        if [ "$downloaded_version" = "${LINCHINE_SCRIPT_VERSION:-unknown}" ]; then
+            log "Linchine is already at version ${LINCHINE_SCRIPT_VERSION}."
+            rm -f "$tmp"
+            return 0
+        fi
+
         if [ -f "$target" ] && cmp -s "$tmp" "$target"; then
             log "Linchine is already up to date."
             rm -f "$tmp"
             return 0
         fi
 
-        log "Update found. Installing updated Linchine script to ${target}..."
+        log "Update found: ${LINCHINE_SCRIPT_VERSION:-unknown} -> ${downloaded_version}. Installing to ${target}..."
         install -m 755 "$tmp" "$target"
         rm -f "$tmp"
 
@@ -128,6 +145,96 @@ install_self() {
         install -m 755 "$source" "$target"
     else
         chmod 755 "$target"
+    fi
+}
+
+install_runtime_dependencies() {
+    # Best-effort dependency repair for minimal Debian installs.
+    # This fixes common issues such as missing useradd, missing Xorg drivers,
+    # missing OpenBox/xterm, and QEMU GTK failing because the X stack is absent.
+    if ! command -v apt-get >/dev/null 2>&1; then
+        log "apt-get not found; skipping automatic dependency repair."
+        return 0
+    fi
+
+    log "Installing/checking Linchine runtime dependencies..."
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update || true
+    apt-get install -y \
+        sudo \
+        passwd \
+        login \
+        adduser \
+        git \
+        qemu-system-x86 \
+        qemu-system-gui \
+        qemu-utils \
+        ovmf \
+        uml-utilities \
+        python3 \
+        python3-pip \
+        python3-venv \
+        wget \
+        curl \
+        unzip \
+        p7zip-full \
+        make \
+        dmg2img \
+        genisoimage \
+        net-tools \
+        screen \
+        vim \
+        pciutils \
+        xinit \
+        xserver-xorg \
+        xserver-xorg-core \
+        xserver-xorg-video-all \
+        xserver-xorg-video-intel \
+        xserver-xorg-input-all \
+        x11-xserver-utils \
+        mesa-utils \
+        openbox \
+        dbus-x11 \
+        xterm \
+        whiptail || log "Some packages failed to install. Continuing so you can inspect/fix manually."
+}
+
+configure_xorg_safe_defaults() {
+    log "Configuring safer Xorg defaults..."
+
+    mkdir -p /etc/X11/xorg.conf.d
+
+    # A stale /etc/X11/xorg.conf can force the old vesa driver, which causes:
+    #   vesa: Ignoring device with a bound kernel driver
+    #   no screens found
+    if [ -f /etc/X11/xorg.conf ] && ! grep -q "Linchine" /etc/X11/xorg.conf 2>/dev/null; then
+        mv /etc/X11/xorg.conf "/etc/X11/xorg.conf.linchine-backup.$(date +%s)" || true
+    fi
+
+    cat > /etc/X11/xorg.conf.d/20-linchine-modesetting.conf <<'EOF'
+Section "Device"
+    Identifier "Linchine Graphics"
+    Driver "modesetting"
+    Option "AccelMethod" "glamor"
+EndSection
+EOF
+
+    # Keep input simple on tiny/minimal installs.
+    cat > /etc/X11/xorg.conf.d/40-linchine-input.conf <<'EOF'
+Section "InputClass"
+    Identifier "Linchine libinput fallback"
+    MatchIsPointer "on"
+    Driver "libinput"
+EndSection
+EOF
+
+    if getent group video >/dev/null 2>&1; then
+        usermod -aG video "$LINCHINE_USER" || true
+    fi
+
+    if getent group render >/dev/null 2>&1; then
+        usermod -aG render "$LINCHINE_USER" || true
     fi
 }
 
@@ -162,6 +269,10 @@ ${LINCHINE_USER} ALL=(ALL) NOPASSWD:ALL
 EOF
 
     chmod 0440 /etc/sudoers.d/linchine
+
+    mkdir -p /var/log/linchine
+    chown -R "$LINCHINE_USER:$LINCHINE_USER" /var/log/linchine || true
+    chmod 0755 /var/log/linchine || true
 }
 
 configure_autologin() {
@@ -179,25 +290,18 @@ EOF
 }
 
 configure_startx() {
-    log "Configuring automatic startx..."
+    log "Configuring automatic Linchine boot on tty1..."
 
     cat > "${LINCHINE_HOME}/.bash_profile" <<'EOF'
-if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
-    startx
+# Auto-start Linchine only on tty1. Disable temporarily with:
+#   export LINCHINE_NO_AUTOSTART=1
+if [ -z "${DISPLAY:-}" ] && [ "$(tty)" = "/dev/tty1" ] && [ "${LINCHINE_NO_AUTOSTART:-0}" != "1" ]; then
+    exec /usr/local/bin/linchine-boot
 fi
 EOF
 
     cat > "${LINCHINE_HOME}/.xinitrc" <<'EOF'
-xset -dpms >/dev/null 2>&1 || true
-xset s off >/dev/null 2>&1 || true
-xset s noblank >/dev/null 2>&1 || true
-
-openbox-session &
-sleep 1
-
-/usr/local/bin/linchine-launcher
-
-sudo poweroff
+exec /usr/local/bin/linchine-session
 EOF
 
     chown "$LINCHINE_USER:$LINCHINE_USER" "${LINCHINE_HOME}/.bash_profile" "${LINCHINE_HOME}/.xinitrc"
@@ -398,46 +502,57 @@ set -euo pipefail
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
-LINCHINE_DIR="/opt/linchine"
-CONFIG_FILE="${LINCHINE_DIR}/config/linchine.conf"
-OSX_DIR="${LINCHINE_DIR}/OSX-KVM-updated"
-
-show_error() {
-    xterm -fullscreen -e "echo 'Linchine error:'; echo \"$1\"; echo; echo 'Press Enter to open a shell.'; read; bash"
-}
-
-run_setup() {
-    xterm -fullscreen -e /usr/local/bin/linchine-setup
-}
-
-if [ ! -d "$OSX_DIR" ]; then
-    xterm -fullscreen -e "echo 'Running Linchine first-boot setup...'; sudo /usr/local/sbin/linchine.sh --firstboot; echo; echo 'Done. Press Enter to continue.'; read"
-fi
-
-if [ ! -f "$CONFIG_FILE" ]; then
-    run_setup
-fi
-
-if [ ! -d "$OSX_DIR" ]; then
-    show_error "OSX-KVM-updated folder is missing. Check internet connection, then run: sudo /usr/local/sbin/linchine.sh --firstboot"
-    exit 1
-fi
-
-if [ ! -f "${OSX_DIR}/BaseSystem.img" ] || [ ! -f "${OSX_DIR}/mac_hdd_ng.img" ]; then
-    run_setup
-fi
-
-if [ ! -f "${OSX_DIR}/OpenCore-Boot.sh" ]; then
-    show_error "OpenCore-Boot.sh is missing."
-    exit 1
-fi
-
-# Keep a small terminal open with the boot log. If QEMU exits instantly, the user
-# sees the error instead of getting a dead blank desktop.
-xterm -title "Linchine Boot Log" -geometry 110x28+20+20 -e /usr/local/bin/linchine-boot --boot-or-shell
+# Compatibility wrapper for older Linchine installs.
+# The real GUI session is handled by linchine-session now.
+exec /usr/local/bin/linchine-session
 EOF
 
     chmod +x /usr/local/bin/linchine-launcher
+}
+
+write_session_command() {
+    log "Writing Linchine X session command..."
+
+    cat > /usr/local/bin/linchine-session <<'EOF'
+#!/bin/bash
+set -u
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+SESSION_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/linchine/session.log"
+mkdir -p "$(dirname "$SESSION_LOG")" 2>/dev/null || true
+
+log() {
+    echo "[Linchine Session] $*" | tee -a "$SESSION_LOG"
+}
+
+xset -dpms >/dev/null 2>&1 || true
+xset s off >/dev/null 2>&1 || true
+xset s noblank >/dev/null 2>&1 || true
+
+if command -v openbox-session >/dev/null 2>&1; then
+    openbox-session >/tmp/linchine-openbox.log 2>&1 &
+    sleep 1
+fi
+
+log "Starting Linchine boot inside X session. DISPLAY=${DISPLAY:-none}"
+
+if command -v xterm >/dev/null 2>&1; then
+    xterm -title "Linchine Boot" -geometry 120x32+20+20 -e /usr/local/bin/linchine-boot --qemu-only
+else
+    /usr/local/bin/linchine-boot --qemu-only
+fi
+
+log "Linchine boot command exited. Keeping a shell open instead of shutting down."
+
+if command -v xterm >/dev/null 2>&1; then
+    exec xterm -fullscreen -e bash
+else
+    exec bash
+fi
+EOF
+
+    chmod +x /usr/local/bin/linchine-session
 }
 
 write_boot_command() {
@@ -445,19 +560,51 @@ write_boot_command() {
 
     cat > /usr/local/bin/linchine-boot <<'EOF'
 #!/bin/bash
-set -euo pipefail
+set -u
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 LINCHINE_DIR="/opt/linchine"
 CONFIG_FILE="${LINCHINE_DIR}/config/linchine.conf"
 OSX_DIR="${LINCHINE_DIR}/OSX-KVM-updated"
-BOOT_LOG="/var/log/linchine-boot.log"
+MODE="${1:-}"
 
-mkdir -p "$(dirname "$BOOT_LOG")" 2>/dev/null || true
+choose_log_file() {
+    local preferred="/var/log/linchine/boot.log"
+    if mkdir -p /var/log/linchine 2>/dev/null && touch "$preferred" 2>/dev/null; then
+        echo "$preferred"
+        return 0
+    fi
+
+    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/linchine"
+    mkdir -p "$state_dir" 2>/dev/null || true
+    if touch "$state_dir/boot.log" 2>/dev/null; then
+        echo "$state_dir/boot.log"
+        return 0
+    fi
+
+    echo "/tmp/linchine-boot-$(id -u).log"
+}
+
+BOOT_LOG="$(choose_log_file)"
 
 log() {
     echo "[Linchine Boot] $*" | tee -a "$BOOT_LOG"
+}
+
+show_xorg_help() {
+    echo
+    echo "Xorg failed to start, so QEMU GTK cannot open a window."
+    echo
+    echo "Most common fixes on Intel laptops:"
+    echo "  sudo apt update"
+    echo "  sudo apt install -y xserver-xorg xserver-xorg-video-all xserver-xorg-video-intel xserver-xorg-input-all x11-xserver-utils mesa-utils"
+    echo "  sudo /usr/local/sbin/linchine.sh --fix-xorg"
+    echo
+    echo "Last Xorg log lines:"
+    echo "------------------------------------------------------------"
+    tail -n 80 /var/log/Xorg.0.log 2>/dev/null || true
+    echo "------------------------------------------------------------"
 }
 
 fail_shell() {
@@ -467,44 +614,105 @@ fail_shell() {
     echo
     echo "Log file: ${BOOT_LOG}"
     echo
-    echo "Last 80 log lines:"
+    echo "Last 120 log lines:"
     echo "------------------------------------------------------------"
-    tail -n 80 "$BOOT_LOG" 2>/dev/null || true
+    tail -n 120 "$BOOT_LOG" 2>/dev/null || true
     echo "------------------------------------------------------------"
     echo
+
+    if [ -n "${DISPLAY:-}" ] && command -v xterm >/dev/null 2>&1; then
+        echo "Opening a shell."
+        exec bash
+    fi
+
     echo "Press Enter to open a shell."
-    read -r _ || true
+    read -r _ 2>/dev/null || true
     exec bash
 }
 
+run_setup_if_possible() {
+    if [ -n "${DISPLAY:-}" ] && command -v xterm >/dev/null 2>&1; then
+        xterm -fullscreen -e /usr/local/bin/linchine-setup
+    else
+        /usr/local/bin/linchine-setup
+    fi
+}
+
+config_passthrough_enabled() {
+    [ -f "$CONFIG_FILE" ] && grep -Eq '^GPU_PASSTHROUGH="?yes"?' "$CONFIG_FILE"
+}
+
+start_x_session() {
+    if ! command -v startx >/dev/null 2>&1; then
+        echo "startx is missing. Install xinit/xserver-xorg, then try again."
+        exit 1
+    fi
+
+    log "No graphical DISPLAY found. Starting Xorg for Linchine..."
+    log "This fixes the common QEMU error: gtk initialization failed."
+
+    # Use a direct client instead of ~/.xinitrc so old broken files cannot power off the machine.
+    startx /usr/local/bin/linchine-session -- :0 -nolisten tcp vt1 >> "$BOOT_LOG" 2>&1
+    status="$?"
+
+    if [ "$status" -ne 0 ]; then
+        log "startx failed with exit code ${status}."
+        show_xorg_help | tee -a "$BOOT_LOG"
+        exit "$status"
+    fi
+}
+
+# Backward compatibility with the older generated launcher.
+if [ "$MODE" = "--boot-or-shell" ]; then
+    MODE="--qemu-only"
+fi
+
+# If this is called manually from the text console, start X first unless passthrough is enabled.
+if [ "$MODE" != "--qemu-only" ] && [ -z "${DISPLAY:-}" ]; then
+    if config_passthrough_enabled; then
+        MODE="--qemu-only"
+    else
+        start_x_session
+        exit $?
+    fi
+fi
+
+: > "$BOOT_LOG" 2>/dev/null || true
+log "Starting Linchine boot."
+log "Running as user: $(id -un 2>/dev/null || echo unknown)"
+log "DISPLAY: ${DISPLAY:-none}"
+
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "Missing config: $CONFIG_FILE"
-    echo "Run: linchine-setup"
-    exit 1
+    log "Missing config: $CONFIG_FILE"
+    log "Launching setup wizard."
+    run_setup_if_possible || fail_shell "$?"
 fi
 
 if [ ! -d "$OSX_DIR" ]; then
-    echo "Missing VM folder: $OSX_DIR"
-    echo "Run: sudo /usr/local/sbin/linchine.sh --firstboot"
-    exit 1
+    log "Missing VM folder: $OSX_DIR"
+    log "Trying first-boot setup now."
+    sudo /usr/local/sbin/linchine.sh --firstboot || fail_shell "$?"
 fi
 
+if [ ! -d "$OSX_DIR" ]; then
+    log "OSX-KVM folder is still missing."
+    fail_shell 1
+fi
+
+# shellcheck disable=SC1090
 source "$CONFIG_FILE"
 
-cd "$OSX_DIR"
+cd "$OSX_DIR" || fail_shell "$?"
 
-if [ ! -f "BaseSystem.img" ]; then
-    echo "Missing BaseSystem.img. Run: linchine-setup"
-    exit 1
+if [ ! -f "BaseSystem.img" ] || [ ! -f "mac_hdd_ng.img" ]; then
+    log "BaseSystem.img or mac_hdd_ng.img is missing. Launching setup wizard."
+    run_setup_if_possible || fail_shell "$?"
 fi
 
-if [ ! -f "mac_hdd_ng.img" ]; then
-    echo "Missing mac_hdd_ng.img. Run: linchine-setup"
-    exit 1
-fi
+# Reload config in case setup created/changed it.
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
 
-: > "$BOOT_LOG" || true
-log "Starting Linchine boot."
 log "macOS product: ${MACOS_PRODUCT:-unknown}"
 log "RAM_MB: ${RAM_MB:-unknown}"
 log "CPU_CORES: ${CPU_CORES:-unknown}"
@@ -520,15 +728,25 @@ if [ "${GPU_PASSTHROUGH:-no}" = "yes" ]; then
 
     if [ -f "boot-linchine-passthrough.sh" ]; then
         chmod +x boot-linchine-passthrough.sh
-        log "Booting QEMU with NVIDIA passthrough using boot-linchine-passthrough.sh."
-        log "If your monitor is attached to the passthrough GPU, output should appear there."
+        log "Booting QEMU with GPU passthrough using boot-linchine-passthrough.sh."
         bash ./boot-linchine-passthrough.sh >> "$BOOT_LOG" 2>&1 || fail_shell "$?"
     else
         chmod +x boot-passthrough.sh
-        log "Booting QEMU with passthrough using boot-passthrough.sh."
+        log "Booting QEMU with GPU passthrough using boot-passthrough.sh."
         bash ./boot-passthrough.sh >> "$BOOT_LOG" 2>&1 || fail_shell "$?"
     fi
 else
+    if [ -z "${DISPLAY:-}" ]; then
+        log "No DISPLAY is available. QEMU GTK cannot start without Xorg."
+        log "Run: linchine-boot"
+        fail_shell 1
+    fi
+
+    if [ ! -f "OpenCore-Boot.sh" ]; then
+        log "OpenCore-Boot.sh is missing."
+        fail_shell 1
+    fi
+
     /usr/local/bin/linchine-patch-opencore || true
     chmod +x OpenCore-Boot.sh
     log "Booting QEMU using OpenCore-Boot.sh."
@@ -1051,13 +1269,15 @@ firstboot_clone_osx_kvm() {
 
 install_mode() {
     require_root
-    check_required_admin_commands
 
     log "Starting Linchine install mode..."
 
     run_self_update "$@"
     install_self
+    install_runtime_dependencies
+    check_required_admin_commands
     ensure_user
+    configure_xorg_safe_defaults
     configure_autologin
     configure_startx
 
@@ -1066,6 +1286,7 @@ install_mode() {
 
     write_gpu_helper
     write_launcher
+    write_session_command
     write_boot_command
     write_patch_opencore
     write_patch_passthrough
@@ -1078,11 +1299,11 @@ install_mode() {
 
 firstboot_mode() {
     require_root
-    check_required_admin_commands
 
     log "Starting Linchine first-boot mode..."
 
     run_self_update "$@"
+    check_required_admin_commands
     configure_kvm
     firstboot_clone_osx_kvm
 
@@ -1098,6 +1319,17 @@ case "${1:-}" in
     --firstboot)
         firstboot_mode "$@"
         ;;
+    --fix-xorg)
+        require_root
+        install_runtime_dependencies
+        if ! id "$LINCHINE_USER" >/dev/null 2>&1; then
+            useradd -m -s /bin/bash "$LINCHINE_USER"
+        fi
+        configure_xorg_safe_defaults
+        ;;
+    --boot)
+        exec /usr/local/bin/linchine-boot
+        ;;
     --no-update-install)
         LINCHINE_SKIP_UPDATE=1 install_mode "$@"
         ;;
@@ -1105,7 +1337,7 @@ case "${1:-}" in
         LINCHINE_SKIP_UPDATE=1 firstboot_mode "$@"
         ;;
     *)
-        echo "Usage: $0 --install | --firstboot"
+        echo "Usage: $0 --install | --firstboot | --fix-xorg | --boot"
         echo
         echo "Environment options:"
         echo "  LINCHINE_SKIP_UPDATE=1    Disable automatic self-update"
