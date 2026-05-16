@@ -3,7 +3,7 @@ set -euo pipefail
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
-LINCHINE_SCRIPT_VERSION="2026.05.16-fix-xorg-boot"
+LINCHINE_SCRIPT_VERSION="2026.05.16-os-select-update-check"
 
 LINCHINE_USER="linchine"
 LINCHINE_HOME="/home/${LINCHINE_USER}"
@@ -64,6 +64,77 @@ fetch_url() {
     fi
 }
 
+get_script_version_from_file() {
+    local file="$1"
+    grep -E '^LINCHINE_SCRIPT_VERSION=' "$file" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '"' || true
+}
+
+download_update_candidate() {
+    local tmp="$1"
+
+    if fetch_url "$SELF_UPDATE_URL_MAIN" "$tmp"; then
+        return 0
+    fi
+
+    if fetch_url "$SELF_UPDATE_URL_MASTER" "$tmp"; then
+        return 0
+    fi
+
+    return 1
+}
+
+validate_update_candidate() {
+    local file="$1"
+
+    grep -q "LINCHINE_USER=" "$file" || return 1
+    grep -q "LINCHINE_SCRIPT_VERSION=" "$file" || return 1
+    bash -n "$file" >/dev/null 2>&1 || return 1
+
+    return 0
+}
+
+check_update_status() {
+    local tmp
+    local online_version
+    local current_version
+
+    tmp="$(mktemp /tmp/linchine-update-check.XXXXXX)"
+    current_version="${LINCHINE_SCRIPT_VERSION:-unknown}"
+
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        echo "Cannot check for updates because curl/wget is not installed."
+        rm -f "$tmp"
+        return 1
+    fi
+
+    if ! download_update_candidate "$tmp"; then
+        echo "Could not reach the Linchine GitHub update URL."
+        rm -f "$tmp"
+        return 1
+    fi
+
+    if ! validate_update_candidate "$tmp"; then
+        echo "Downloaded update file did not look like a valid Linchine script."
+        rm -f "$tmp"
+        return 1
+    fi
+
+    online_version="$(get_script_version_from_file "$tmp")"
+
+    echo "Installed/running version: ${current_version}"
+    echo "GitHub version:            ${online_version}"
+
+    if [ "$online_version" = "$current_version" ]; then
+        echo "Status: up to date."
+    else
+        echo "Status: update available."
+    fi
+
+    rm -f "$tmp"
+    return 0
+}
+
+
 run_self_update() {
     # Best-effort self update. It never blocks install if the network/repo is unavailable.
     # Disable with: LINCHINE_SKIP_UPDATE=1 sudo ./linchine.sh --install
@@ -121,12 +192,8 @@ run_self_update() {
         install -m 755 "$tmp" "$target"
         rm -f "$tmp"
 
-        if [ "$self" = "$target" ]; then
-            log "Restarting into updated Linchine script..."
-            LINCHINE_ALREADY_UPDATED=1 exec "$target" "$@"
-        fi
-
-        log "Updated installed script. Continuing this run."
+        log "Restarting into updated Linchine script..."
+        LINCHINE_ALREADY_UPDATED=1 exec "$target" "$@"
     else
         log "Self-update check failed or no network is available. Continuing."
         rm -f "$tmp"
@@ -1288,9 +1355,9 @@ install_mode() {
 
     log "Starting Linchine install mode..."
 
-    run_self_update "$@"
     install_self
     install_runtime_dependencies
+    run_self_update "$@"
     check_required_admin_commands
     ensure_user
     configure_xorg_safe_defaults
@@ -1346,6 +1413,14 @@ case "${1:-}" in
     --boot)
         exec /usr/local/bin/linchine-boot
         ;;
+    --check-update)
+        check_update_status
+        ;;
+    --update)
+        require_root
+        run_self_update "$@"
+        log "No update was installed. Linchine is already up to date or the update source was unavailable."
+        ;;
     --no-update-install)
         LINCHINE_SKIP_UPDATE=1 install_mode "$@"
         ;;
@@ -1353,7 +1428,7 @@ case "${1:-}" in
         LINCHINE_SKIP_UPDATE=1 firstboot_mode "$@"
         ;;
     *)
-        echo "Usage: $0 --install | --firstboot | --fix-xorg | --boot"
+        echo "Usage: $0 --install | --firstboot | --fix-xorg | --boot | --check-update | --update"
         echo
         echo "Environment options:"
         echo "  LINCHINE_SKIP_UPDATE=1    Disable automatic self-update"
